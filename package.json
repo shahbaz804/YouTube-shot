@@ -1,0 +1,72 @@
+const express = require('express');
+const cors = require('cors');
+const ffmpeg = require('fluent-ffmpeg');
+const ytDlp = require('yt-dlp-exec');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static('public')); // Frontend files ke liye
+
+const TEMP_DIR = path.join(__dirname, 'temp');
+const CLIPS_DIR = path.join(__dirname, 'clips');
+
+[TEMP_DIR, CLIPS_DIR].forEach(dir => {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+});
+
+app.use('/clips', express.static(CLIPS_DIR));
+
+app.post('/api/auto-clip', async (req, res) => {
+    const { videoUrl } = req.body;
+    if (!videoUrl) return res.status(400).json({ error: 'Video URL zaroori hai' });
+
+    const videoId = Date.now().toString();
+    const rawVideoPath = path.join(TEMP_DIR, `${videoId}.mp4`);
+    const outputPattern = path.join(CLIPS_DIR, `clip-${videoId}-%03d.mp4`);
+
+    try {
+        // Download video
+        await ytDlp(videoUrl, {
+            output: rawVideoPath,
+            format: 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]',
+            mergeOutputFormat: 'mp4'
+        });
+
+        // FFmpeg se 30-30 second ke clips banayein
+        await new Promise((resolve, reject) => {
+            ffmpeg(rawVideoPath)
+                .outputOptions([
+                    '-c:v', 'libx264', '-crf', '20', '-preset', 'fast',
+                    '-c:a', 'copy',
+                    '-force_key_frames', 'expr:gte(t,n_forced*30)',
+                    '-f', 'segment',
+                    '-segment_time', '30',
+                    '-reset_timestamps', '1'
+                ])
+                .output(outputPattern)
+                .on('end', resolve)
+                .on('error', reject)
+                .run();
+        });
+
+        if (fs.existsSync(rawVideoPath)) fs.unlinkSync(rawVideoPath);
+
+        const files = fs.readdirSync(CLIPS_DIR)
+            .filter(f => f.startsWith(`clip-${videoId}-`))
+            .map(f => `/clips/${f}`);
+
+        res.json({ success: true, clips: files });
+
+    } catch (error) {
+        if (fs.existsSync(rawVideoPath)) fs.unlinkSync(rawVideoPath);
+        res.status(500).json({ error: 'Auto clip failed: ' + error.message });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
